@@ -1,3 +1,4 @@
+import difflib
 import shutil
 import tempfile
 import uuid
@@ -14,7 +15,7 @@ from app.tools.test_runner import run_tests
 
 
 def investigate(workspace: str) -> dict:
-    """Investigate a failing project. Each patch is attempted in a fresh copy."""
+    """Investigate a failing project. Each patch attempt uses a clean copy."""
     investigation_id = str(uuid.uuid4())
     root = Path(workspace).resolve()
     events: list[dict] = []
@@ -47,40 +48,39 @@ def investigate(workspace: str) -> dict:
         return {"investigation_id": investigation_id, "status": "repair_plan_rejected", "failure": failure.model_dump(), "repair_plan": plan.model_dump(), "events": events}
 
     last_raw = None
-    # Each attempt starts from a clean copy; failed edits never contaminate retry context.
-    for attempt in range(1, max(1, settings.max_repair_attempts) + 1):
+    attempts_limit = max(1, settings.max_repair_attempts)
+    for attempt in range(1, attempts_limit + 1):
         attempt_dir = Path(tempfile.mkdtemp(prefix=f"patchpilot-{investigation_id}-"))
         try:
             shutil.copytree(root, attempt_dir / "project", dirs_exist_ok=True, symlinks=False)
             attempt_root = attempt_dir / "project"
-            attempt_sources = {p: read_source_file(str(attempt_root), p) for p in candidates}
-            patch = generate_patch(plan.model_dump(), attempt_sources, candidates)
-            changed = apply_patch(str(attempt_root), patch, candidates)
+            if not plan.files_to_change or not set(plan.files_to_change).issubset(set(candidates)):
+                return {"investigation_id": investigation_id, "status": "repair_plan_rejected", "failure": failure.model_dump(), "repair_plan": plan.model_dump(), "attempts": attempt - 1, "events": events}
+            approved = list(plan.files_to_change)
+            attempt_sources = {p: read_source_file(str(attempt_root), p) for p in approved}
+            patch = generate_patch(plan.model_dump(), attempt_sources, approved)
+            changed = apply_patch(str(attempt_root), patch, approved)
             record("patch_applied", {"attempt": attempt, "files": changed})
             raw = run_tests(str(attempt_root))
             last_raw = raw
             verification = verify_repair(raw)
             record("verification_completed", {"attempt": attempt, "passed": verification.passed})
             if verification.passed:
-                # Return the changed contents and diffs in the result; leave uploaded original untouched.
                 diffs = []
-                import difflib
                 for rel in changed:
                     before = (root / rel).read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
                     after = (attempt_root / rel).read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
                     diffs.append({"path": rel, "diff": "".join(difflib.unified_diff(before, after, fromfile=f"a/{rel}", tofile=f"b/{rel}"))})
                 return {"investigation_id": investigation_id, "status": "verification_passed", "failure": failure.model_dump(), "repair_plan": plan.model_dump(), "changed_files": changed, "diffs": diffs, "verification": verification.model_dump(), "attempts": attempt, "baseline": {k: v for k, v in baseline.items() if k != "output"}, "latest_test_output": raw["output"][-10000:], "events": events}
-            # Add new execution evidence to the next attempt prompt via updated plan context.
-            if attempt < settings.max_repair_attempts:
+            if attempt < attempts_limit:
                 plan = create_repair_plan({**failure.model_dump(), "latest_verification_output": raw["output"][-10000:]}, attempt_sources)
                 record("repair_plan_revised", {"after_attempt": attempt})
         except Exception as exc:
             record("repair_attempt_error", {"attempt": attempt, "type": type(exc).__name__})
-            if attempt >= settings.max_repair_attempts:
+            if attempt >= attempts_limit:
                 return {"investigation_id": investigation_id, "status": "repair_error", "failure": failure.model_dump(), "repair_plan": plan.model_dump(), "attempts": attempt, "error": "Repair attempt could not be completed safely.", "events": events}
         finally:
             shutil.rmtree(attempt_dir, ignore_errors=True)
 
-    from app.agents.verifier import verify_repair
     verification = verify_repair(last_raw or {"passed": False, "exit_code": None, "output": "No verification result", "timed_out": False})
-    return {"investigation_id": investigation_id, "status": "repair_failed", "failure": failure.model_dump(), "repair_plan": plan.model_dump(), "verification": verification.model_dump(), "attempts": max(1, settings.max_repair_attempts), "latest_test_output": (last_raw or {}).get("output", "")[-10000:], "events": events}
+    return {"investigation_id": investigation_id, "status": "repair_failed", "failure": failure.model_dump(), "repair_plan": plan.model_dump(), "verification": verification.model_dump(), "attempts": attempts_limit, "latest_test_output": (last_raw or {}).get("output", "")[-10000:], "events": events}
